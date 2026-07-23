@@ -29,10 +29,9 @@ export interface PublicAgentState {
 export interface PendingInterrupt {
   id: string;
   value: {
-    type: "plan-approval" | "answer-question" | "review-feedback";
+    type: "plan-approval";
     message?: string;
     lessonPlan?: LessonPlan | null;
-    question?: MCQQuestion;
   };
 }
 

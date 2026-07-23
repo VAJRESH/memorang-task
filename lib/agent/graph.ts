@@ -1,36 +1,27 @@
 import { END, MemorySaver, START, StateGraph } from "@langchain/langgraph";
 
 import { AgentStateAnnotation, type AgentState } from "./state";
-import {
-  approvalNode,
-  evaluatorNode,
-  mcqGeneratorNode,
-  plannerNode,
-  reviewNode,
-  summaryNode,
-} from "./nodes";
+import { approvalNode, mcqGeneratorNode, plannerNode } from "./nodes";
 
 /**
- * Assemble and compile the Memorang AI Learning Agent LangGraph workflow.
+ * Simplified Memorang AI Learning Agent LangGraph workflow.
  *
- * Flow:
+ * The graph is responsible ONLY for LLM-dependent operations:
  *   START -> planner -> approval
- *     approval --(approved)--> mcqGenerator
+ *     approval --(approved)--> mcqGenerator -> END
+ *     approval --(revise)----> approval (loop for revision)
  *     approval --(rejected)--> END
- *   mcqGenerator -> evaluator
- *     evaluator --(more questions / objectives)--> evaluator | mcqGenerator
- *     evaluator --(completed)--> END
+ *
+ * Answer evaluation, attempt tracking, objective advancement, and summary
+ * computation are handled client-side (no LLM needed for those).
  *
  * A `MemorySaver` checkpointer persists state between `interrupt()` pauses so
- * the HITL approval and per-question answer submissions can resume the graph.
+ * the HITL approval can resume the graph.
  */
 
 const PLANNER = "planner";
 const APPROVAL = "approval";
 const MCQ_GENERATOR = "mcqGenerator";
-const EVALUATOR = "evaluator";
-const REVIEW = "review";
-const SUMMARY = "summarize";
 
 /** Route out of the approval node based on the HITL decision. */
 function routeAfterApproval(
@@ -43,44 +34,11 @@ function routeAfterApproval(
   return END;
 }
 
-/**
- * Route out of the evaluator node based on the latest answer feedback:
- * - incorrect -> back to the evaluator so the learner can retry with the hint.
- * - correct -> the review node, which shows the explanation before advancing.
- */
-function routeAfterEvaluator(
-  state: AgentState,
-): typeof EVALUATOR | typeof REVIEW {
-  return state.feedback?.isCorrect ? REVIEW : EVALUATOR;
-}
-
-/**
- * Route out of the review node (after the learner continues past a correct
- * answer):
- * - lesson complete -> summary
- * - current objective still has generated questions -> evaluator
- * - objective advanced (questions cleared) -> regenerate via mcqGenerator
- */
-function routeAfterReview(
-  state: AgentState,
-): typeof EVALUATOR | typeof MCQ_GENERATOR | typeof SUMMARY {
-  if (state.isCompleted) {
-    return SUMMARY;
-  }
-  const hasPendingQuestion =
-    state.questions.length > 0 &&
-    state.currentQuestionIndex < state.questions.length;
-  return hasPendingQuestion ? EVALUATOR : MCQ_GENERATOR;
-}
-
 function buildGraph() {
   const workflow = new StateGraph(AgentStateAnnotation)
     .addNode(PLANNER, plannerNode)
     .addNode(APPROVAL, approvalNode)
     .addNode(MCQ_GENERATOR, mcqGeneratorNode)
-    .addNode(EVALUATOR, evaluatorNode)
-    .addNode(REVIEW, reviewNode)
-    .addNode(SUMMARY, summaryNode)
     .addEdge(START, PLANNER)
     .addEdge(PLANNER, APPROVAL)
     .addConditionalEdges(APPROVAL, routeAfterApproval, {
@@ -88,17 +46,7 @@ function buildGraph() {
       [APPROVAL]: APPROVAL,
       [END]: END,
     })
-    .addEdge(MCQ_GENERATOR, EVALUATOR)
-    .addConditionalEdges(EVALUATOR, routeAfterEvaluator, {
-      [EVALUATOR]: EVALUATOR,
-      [REVIEW]: REVIEW,
-    })
-    .addConditionalEdges(REVIEW, routeAfterReview, {
-      [EVALUATOR]: EVALUATOR,
-      [MCQ_GENERATOR]: MCQ_GENERATOR,
-      [SUMMARY]: SUMMARY,
-    })
-    .addEdge(SUMMARY, END);
+    .addEdge(MCQ_GENERATOR, END);
 
   return workflow;
 }
@@ -107,8 +55,9 @@ function buildGraph() {
 export const checkpointer = new MemorySaver();
 
 /**
- * The compiled Memorang learning agent graph, ready to be invoked or bound to
- * the CopilotKit runtime.
+ * The compiled Memorang learning agent graph, ready to be invoked.
+ * After approval it generates MCQs for the first objective and returns.
+ * Subsequent objectives' MCQs are generated via a standalone call.
  */
 export const agentGraph = buildGraph().compile({ checkpointer });
 

@@ -2,9 +2,13 @@
 
 import type {
   AgentResponse,
+  AnswerFeedback,
   LearningPhase,
+  LessonSummary,
+  MCQQuestion,
   PendingInterrupt,
   PublicAgentState,
+  UserAttempts,
 } from "@/lib/agent/client-types";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ROUTES } from "../constant";
@@ -52,6 +56,8 @@ export function useLearningAgent() {
   const threadIdRef = useRef<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
   const providerRef = useRef<AIProvider>("groq");
+  /** Store PDF text for generating MCQs for subsequent objectives. */
+  const pdfTextRef = useRef<string>("");
 
   const [provider, setProvider] = useState<AIProvider>("groq");
   const [state, setState] = useState<PublicAgentState>(EMPTY_STATE);
@@ -146,14 +152,13 @@ export function useLearningAgent() {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "complete", sessionId, ...summary }),
         });
-
-        // Refresh session list.
         loadSessions();
       } catch {}
     },
-    [],
+    [loadSessions],
   );
 
+  // --- Agent calls (graph-based: start and resume only) ---
   const callAgent = useCallback(
     async (
       body:
@@ -180,7 +185,75 @@ export function useLearningAgent() {
     [applyResponse],
   );
 
-  /** Upload a PDF, extract text, and start the agent. */
+  // --- Standalone MCQ generation for subsequent objectives ---
+  const fetchMCQs = useCallback(
+    async (objectiveIndex: number): Promise<MCQQuestion[]> => {
+      const plan = state.lessonPlan;
+      if (!plan) throw new Error("No lesson plan");
+
+      const objective = plan.objectives[objectiveIndex];
+      if (!objective) throw new Error("Invalid objective index");
+
+      const res = await fetch(ROUTES.api.agent, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "generate-mcqs",
+          pdfText: pdfTextRef.current,
+          objective,
+          objectiveIndex,
+          provider: providerRef.current,
+        }),
+      });
+
+      const data = (await res.json()) as {
+        questions?: MCQQuestion[];
+        error?: string;
+      };
+      if (!res.ok || data.error) {
+        throw new Error(data.error ?? "Failed to generate questions");
+      }
+      return data.questions ?? [];
+    },
+    [state.lessonPlan],
+  );
+
+  // --- Standalone study-tips generation ---
+  const fetchStudyTips = useCallback(
+    async (params: {
+      totalQuestions: number;
+      totalCorrect: number;
+      totalAttempts: number;
+      perObjective: { title: string; correct: number; total: number }[];
+    }): Promise<string[]> => {
+      try {
+        const res = await fetch(ROUTES.api.agent, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "generate-tips",
+            lessonTitle: state.lessonPlan?.title ?? "the lesson",
+            ...params,
+            provider: providerRef.current,
+          }),
+        });
+        const data = (await res.json()) as { tips?: string[]; error?: string };
+        return (
+          data.tips ?? [
+            "Review the objectives where you needed multiple attempts.",
+          ]
+        );
+      } catch {
+        return [
+          "Review the objectives where you needed multiple attempts.",
+          "Re-read the source material and try the lesson again.",
+        ];
+      }
+    },
+    [state.lessonPlan],
+  );
+
+  /** Upload a PDF, extract text, and start the agent graph. */
   const uploadPdf = useCallback(
     async (file: File): Promise<void> => {
       setError(null);
@@ -199,6 +272,7 @@ export function useLearningAgent() {
           throw new Error(detail.error ?? `Upload failed (${res.status})`);
         }
         const { text } = (await res.json()) as { text: string };
+        pdfTextRef.current = text;
 
         const threadId = newThreadId();
         threadIdRef.current = threadId;
@@ -212,6 +286,7 @@ export function useLearningAgent() {
     [callAgent],
   );
 
+  /** Resume the graph (used for plan approval/rejection/revision). */
   const resume = useCallback(
     async (resumeValue: unknown): Promise<void> => {
       const threadId = threadIdRef.current;
@@ -246,14 +321,217 @@ export function useLearningAgent() {
     (feedback: string) => resume({ revise: true, feedback }),
     [resume],
   );
+
+  /**
+   * Submit an answer — evaluated server-side via /api/evaluate.
+   * The server holds the correct answers; the client never sees them.
+   */
   const submitAnswer = useCallback(
-    (selectedOptionId: string) => resume({ selectedOptionId }),
-    [resume],
+    async (selectedOptionId: string) => {
+      const question = state.questions[state.currentQuestionIndex];
+      if (!question) return;
+
+      setError(null);
+      setIsBusy(true);
+
+      try {
+        const res = await fetch(ROUTES.api.evaluate, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            questionId: question.id,
+            selectedOptionId,
+          }),
+        });
+
+        const feedback = (await res.json()) as AnswerFeedback & {
+          error?: string;
+        };
+
+        if (!res.ok || feedback.error) {
+          throw new Error(feedback.error ?? "Failed to evaluate answer");
+        }
+
+        setState((prev) => {
+          const prevAttempt = prev.userAttempts[question.id] ?? {
+            attempts: 0,
+            correct: false,
+          };
+
+          const newAttempts: UserAttempts = {
+            ...prev.userAttempts,
+            [question.id]: {
+              attempts: prevAttempt.attempts + 1,
+              correct: prevAttempt.correct || feedback.isCorrect,
+            },
+          };
+
+          // Fire-and-forget: record attempt to DB.
+          const objective =
+            prev.lessonPlan?.objectives[question.objectiveIndex];
+          recordAttempt({
+            questionId: question.id,
+            objectiveTitle: objective?.title ?? "Unknown",
+            question: question.question,
+            selectedOptionId,
+            correct: feedback.isCorrect,
+            attemptNumber: prevAttempt.attempts + 1,
+          });
+
+          return { ...prev, userAttempts: newAttempts, feedback };
+        });
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to evaluate answer");
+      } finally {
+        setIsBusy(false);
+      }
+    },
+    [state.questions, state.currentQuestionIndex, recordAttempt],
   );
-  const continueLesson = useCallback(
-    () => resume({ continue: true }),
-    [resume],
-  );
+
+  /**
+   * Continue to the next question or objective after a correct answer.
+   * If the current objective's questions are exhausted, clears questions so
+   * the MCQ-fetching effect fires for the next objective. If all objectives
+   * are done, marks completed so the summary-generating effect fires.
+   */
+  const continueLesson = useCallback(() => {
+    setError(null);
+
+    setState((prev) => {
+      const nextQuestionIndex = prev.currentQuestionIndex + 1;
+
+      if (nextQuestionIndex < prev.questions.length) {
+        // More questions in this objective batch.
+        return {
+          ...prev,
+          currentQuestionIndex: nextQuestionIndex,
+          feedback: null,
+        };
+      }
+
+      // Objective exhausted — check if there are more objectives.
+      const nextObjectiveIndex = prev.currentObjectiveIndex + 1;
+      const totalObjectives = prev.lessonPlan?.objectives.length ?? 0;
+
+      if (nextObjectiveIndex >= totalObjectives) {
+        // All done — mark completed (summary effect will generate tips).
+        return { ...prev, isCompleted: true, feedback: null, questions: [] };
+      }
+
+      // Clear questions so the MCQ-fetching effect fires for the next objective.
+      return {
+        ...prev,
+        currentObjectiveIndex: nextObjectiveIndex,
+        currentQuestionIndex: 0,
+        questions: [],
+        feedback: null,
+      };
+    });
+  }, []);
+
+  // --- Effect: fetch MCQs when questions are empty during quizzing ---
+  const isFetchingMcqs = useRef(false);
+  useEffect(() => {
+    if (
+      state.isPlanApproved &&
+      !state.isCompleted &&
+      state.questions.length === 0 &&
+      !isBusy &&
+      !isFetchingMcqs.current
+    ) {
+      isFetchingMcqs.current = true;
+      setIsBusy(true);
+      fetchMCQs(state.currentObjectiveIndex)
+        .then((questions) => {
+          setState((prev) => ({ ...prev, questions, currentQuestionIndex: 0 }));
+        })
+        .catch((e) => {
+          setError(
+            e instanceof Error ? e.message : "Failed to generate questions",
+          );
+        })
+        .finally(() => {
+          setIsBusy(false);
+          isFetchingMcqs.current = false;
+        });
+    }
+  }, [
+    state.isPlanApproved,
+    state.isCompleted,
+    state.questions.length,
+    state.currentObjectiveIndex,
+    isBusy,
+    fetchMCQs,
+  ]);
+
+  // --- Effect: generate summary when lesson is completed ---
+  const isGeneratingSummary = useRef(false);
+  useEffect(() => {
+    if (state.isCompleted && !state.summary && !isGeneratingSummary.current) {
+      isGeneratingSummary.current = true;
+      setIsBusy(true);
+
+      const attempts = state.userAttempts;
+      const questionIds = Object.keys(attempts);
+      const totalQuestions = questionIds.length;
+      const totalCorrect = questionIds.filter(
+        (id) => attempts[id].correct,
+      ).length;
+      const totalAttempts = questionIds.reduce(
+        (sum, id) => sum + attempts[id].attempts,
+        0,
+      );
+
+      const perObjective = (state.lessonPlan?.objectives ?? [])
+        .map((objective, index) => {
+          const ids = questionIds.filter((id) => id.startsWith(`obj${index}-`));
+          const correct = ids.filter((id) => attempts[id].correct).length;
+          return { title: objective.title, correct, total: ids.length };
+        })
+        .filter((o) => o.total > 0);
+
+      fetchStudyTips({
+        totalQuestions,
+        totalCorrect,
+        totalAttempts,
+        perObjective,
+      })
+        .then((studyTips) => {
+          const summary: LessonSummary = {
+            totalQuestions,
+            totalCorrect,
+            totalAttempts,
+            perObjective,
+            studyTips,
+          };
+          setState((prev) => ({ ...prev, summary }));
+
+          // Persist to DB.
+          completeSession({
+            totalQuestions,
+            totalCorrect,
+            totalAttempts,
+            accuracy:
+              totalQuestions > 0
+                ? Math.round((totalCorrect / totalQuestions) * 100)
+                : 0,
+            studyTips,
+          });
+        })
+        .finally(() => {
+          setIsBusy(false);
+          isGeneratingSummary.current = false;
+        });
+    }
+  }, [
+    state.isCompleted,
+    state.summary,
+    state.userAttempts,
+    state.lessonPlan,
+    fetchStudyTips,
+    completeSession,
+  ]);
 
   const switchProvider = useCallback((p: AIProvider) => {
     setProvider(p);
@@ -263,10 +541,13 @@ export function useLearningAgent() {
   const reset = useCallback(() => {
     threadIdRef.current = null;
     sessionIdRef.current = null;
+    pdfTextRef.current = "";
     setState(EMPTY_STATE);
     setInterrupt(null);
     setError(null);
     setIsBusy(false);
+    isFetchingMcqs.current = false;
+    isGeneratingSummary.current = false;
   }, []);
 
   const phase: LearningPhase = useMemo(() => {
@@ -284,11 +565,13 @@ export function useLearningAgent() {
     [state.questions, state.currentQuestionIndex],
   );
 
-  const isReviewing = interrupt?.value?.type === "review-feedback";
+  // "Reviewing" = the user answered correctly and sees the explanation.
+  const isReviewing = useMemo(
+    () => state.feedback?.isCorrect === true,
+    [state.feedback],
+  );
 
-  // --- Side effects: persist session data when state transitions occur ---
-
-  // Create session when plan is first approved.
+  // --- Side effect: create session when plan is first approved ---
   const prevApproved = useRef(false);
   useEffect(() => {
     if (state.isPlanApproved && !prevApproved.current && state.lessonPlan) {
@@ -301,56 +584,6 @@ export function useLearningAgent() {
     }
     if (!state.isPlanApproved) prevApproved.current = false;
   }, [state.isPlanApproved, state.lessonPlan, createSession]);
-
-  // Record attempt when feedback arrives.
-  const lastFeedbackRef = useRef<string | null>(null);
-  useEffect(() => {
-    const fb = state.feedback;
-    if (!fb) return;
-    const key = `${fb.questionId}-${fb.selectedOptionId}`;
-    if (key === lastFeedbackRef.current) return;
-    lastFeedbackRef.current = key;
-
-    const question = state.questions.find((q) => q.id === fb.questionId);
-    const objective =
-      state.lessonPlan?.objectives[question?.objectiveIndex ?? 0];
-    const attemptNumber = state.userAttempts[fb.questionId]?.attempts ?? 1;
-
-    recordAttempt({
-      questionId: fb.questionId,
-      objectiveTitle: objective?.title ?? "Unknown",
-      question: question?.question ?? "",
-      selectedOptionId: fb.selectedOptionId,
-      correct: fb.isCorrect,
-      attemptNumber,
-    });
-  }, [
-    state.feedback,
-    state.questions,
-    state.lessonPlan,
-    state.userAttempts,
-    recordAttempt,
-  ]);
-
-  // Complete session when summary arrives.
-  const completedRef = useRef(false);
-  useEffect(() => {
-    if (state.summary && !completedRef.current) {
-      completedRef.current = true;
-      const s = state.summary;
-      completeSession({
-        totalQuestions: s.totalQuestions,
-        totalCorrect: s.totalCorrect,
-        totalAttempts: s.totalAttempts,
-        accuracy:
-          s.totalQuestions > 0
-            ? Math.round((s.totalCorrect / s.totalQuestions) * 100)
-            : 0,
-        studyTips: s.studyTips,
-      });
-    }
-    if (!state.summary) completedRef.current = false;
-  }, [state.summary, completeSession]);
 
   return {
     state,

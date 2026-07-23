@@ -2,6 +2,7 @@ export const ROUTES = {
   api: {
     session: "/api/sessions",
     agent: "/api/agent",
+    evaluate: "/api/evaluate",
     uploadPdf: "/api/upload-pdf",
   },
 };

@@ -12,7 +12,14 @@ lesson plan. Choose an overall difficulty (beginner, intermediate, or advanced)
 that matches the material. Break the content into 3-5 focused learning
 objectives, ordered from foundational to advanced. Each objective must be
 directly grounded in the document content — do not invent topics that are not
-present in the text.`;
+present in the text.
+
+Your output must be a JSON object with exactly these fields:
+- "title": string (the overall lesson title)
+- "difficulty": one of "beginner", "intermediate", or "advanced"
+- "objectives": array of objects, each with "title" (string) and "description" (string)
+
+Do not add any other fields. Do not wrap the object in another key.`;
 
 /** Builds the human prompt that feeds PDF text into the planner. */
 export function buildPlannerHumanPrompt(pdfText: string): string {
@@ -29,7 +36,31 @@ of a specific learning objective. Rules:
 - Provide a clear explanation shown only after a correct answer.
 - Provide a subtle hint that nudges the learner toward the concept WITHOUT
   revealing or eliminating specific answer choices.
-- Set objectiveIndex to the provided objective index for every question.`;
+- Set objectiveIndex to the provided objective index for every question.
+- Set id to a unique string identifier for each question.
+
+Your output must be a JSON object with this exact structure:
+{
+  "questions": [
+    {
+      "id": "<unique string>",
+      "objectiveIndex": <number>,
+      "question": "<question text>",
+      "choices": [
+        { "id": "a", "text": "<choice text>" },
+        { "id": "b", "text": "<choice text>" },
+        { "id": "c", "text": "<choice text>" },
+        { "id": "d", "text": "<choice text>" }
+      ],
+      "correctOptionId": "<one of a, b, c, d>",
+      "explanation": "<explanation text>",
+      "hint": "<hint text>"
+    }
+  ]
+}
+
+Do NOT use an "options" object. Use the "choices" array format shown above.
+Do NOT omit the "id" or "objectiveIndex" fields from any question.`;
 
 /** Builds the human prompt for generating MCQs for one objective. */
 export function buildMcqHumanPrompt(params: {
@@ -44,9 +75,12 @@ export function buildMcqHumanPrompt(params: {
     `Objective title: ${objective.title}`,
     `Objective description: ${objective.description}`,
     ``,
-    `Generate ${count} multiple-choice question(s) for this objective, grounded`,
-    `in the document content below:`,
+    `Generate ${count} multiple-choice question(s) for this objective.`,
+    `Use "obj${objectiveIndex}-q0", "obj${objectiveIndex}-q1", etc. as the question ids.`,
+    `Set objectiveIndex to ${objectiveIndex} for every question.`,
+    `Remember: use "choices" array with {id, text} objects, NOT an "options" object.`,
     ``,
+    `Document content:`,
     `"""`,
     pdfText,
     `"""`,

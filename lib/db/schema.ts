@@ -13,7 +13,8 @@ import {
  *
  * Each PDF upload creates a `session`. Each question answered within that
  * session creates an `attempt`. The summary at the end updates the session
- * with final stats.
+ * with final stats. Generated questions are stored in `questions` so the
+ * server can evaluate answers without exposing correct options to the client.
  */
 
 /** A learning session = one PDF uploaded and worked through. */
@@ -69,7 +70,32 @@ export const attempts = pgTable("attempts", {
   createdAt: timestamp("created_at").defaultNow().notNull(),
 });
 
+/**
+ * Generated MCQ questions stored server-side for secure evaluation.
+ * The client never receives correctOptionId, explanation, or hint directly —
+ * they are only revealed through the /api/evaluate endpoint after submission.
+ */
+export const questions = pgTable("questions", {
+  /** Deterministic question ID (e.g. "obj0-q0"). Used as primary key. */
+  id: text("id").primaryKey(),
+  /** Index of the objective this question belongs to. */
+  objectiveIndex: integer("objective_index").notNull(),
+  /** The question prompt text. */
+  question: text("question").notNull(),
+  /** The four answer choices as JSON array of {id, text}. */
+  choices: jsonb("choices").$type<{ id: string; text: string }[]>().notNull(),
+  /** The correct choice ID (a, b, c, or d). */
+  correctOptionId: text("correct_option_id").notNull(),
+  /** Explanation shown after a correct answer. */
+  explanation: text("explanation").notNull(),
+  /** Hint shown after an incorrect answer. */
+  hint: text("hint").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+});
+
 export type Session = typeof sessions.$inferSelect;
 export type NewSession = typeof sessions.$inferInsert;
 export type Attempt = typeof attempts.$inferSelect;
 export type NewAttempt = typeof attempts.$inferInsert;
+export type Question = typeof questions.$inferSelect;
+export type NewQuestion = typeof questions.$inferInsert;
